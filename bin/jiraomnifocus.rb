@@ -18,6 +18,7 @@ def get_opts
 jira:
   hostname: 'http://please-configure-me-in-jofsync.yaml.atlassian.net'
   keychain: false
+  auth_method: 'basic_auth'
   username: ''
   password: ''
   filter:   'resolution = Unresolved and issue in watchedissues()'
@@ -29,23 +30,24 @@ omnifocus:
   newproj:  false      # Set 'true' to add each JIRA ticket to OF as a Project instead of a Task.
   folder:   'Jira'     # Sets the OF folder where new Projects are created (only applies if 'newproj' is 'true').
 EOS
-  end
+	end
 
 	return Trollop::options do
-		banner ""
+		banner ''
 		banner <<-EOS
-		Jira OmniFocus Sync Tool
+Jira OmniFocus Sync Tool
 
 Usage:
-       jofsync [options]
+    jofsync [options]
 
 KNOWN ISSUES:
-      * With long names you must use an equal sign ( i.e. --hostname=test-target-1 )
+    * With long names you must use an equal sign ( i.e. --hostname=test-target-1 )
 
 ---
 EOS
   version 'jofsync 1.1.0'
 		opt :usekeychain,'Use Keychain for Jira',:type => :boolean,  :short => 'k', :required => false,   :default => config["jira"]["keychain"]
+		opt :auth_method, 'Auth-Method',        :type => :string,   :short => 'a', :required => false,   :default => config["jira"]["auth_method"]
 		opt :username,  'Jira Username',        :type => :string,   :short => 'u', :required => false,   :default => config["jira"]["username"]
 		opt :password,  'Jira Password',        :type => :string,   :short => 'p', :required => false,   :default => config["jira"]["password"]
 		opt :hostname,  'Jira Server Hostname', :type => :string,   :short => 'h', :required => false,   :default => config["jira"]["hostname"]
@@ -63,6 +65,7 @@ end
 # This method gets all issues that are assigned to your USERNAME and whos status isn't Closed or Resolved.  It returns a Hash where the key is the Jira Ticket Key and the value is the Jira Ticket Summary.
 def get_issues
 	jira_issues = Hash.new
+
 	# This is the REST URL that will be hit.  Change the jql query if you want to adjust the query used here
 	uri = URI($opts[:hostname] + '/rest/api/2/search?jql=' + URI::encode($opts[:filter]))
 
@@ -77,9 +80,30 @@ def get_issues
 		end
 	end
 
+	if $opts[:auth_method] == 'cookie'
+		auth_uri = URI($opts[:hostname] + '/rest/auth/1/session')
+		Net::HTTP.start(auth_uri.hostname, auth_uri.port, :use_ssl => auth_uri.scheme == 'https') do |http|
+			request = Net::HTTP::Post.new(auth_uri, initheader = {'Content-Type' =>'application/json'})
+			request.body = '{ "username": "' + $opts[:username] + '", "password": "' + $opts[:password] + '" }'
+			response = http.request request
+			# If the response was good, then grab the data
+			if response.code =~ /20[0-9]{1}/
+				puts 'Connected successfully to ' + uri.hostname + ' using Cookie-Auth'
+				$session = JSON.parse(response.body)
+			else
+				raise StandardError, 'Unsuccessful Cookie-Auth: HTTP response code ' + response.code + ' from ' + uri.hostname
+			end
+		end
+	end
+
 	Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') do |http|
 		request = Net::HTTP::Get.new(uri)
-		request.basic_auth $opts[:username], $opts[:password]
+		if $session['session']
+			cookie = CGI::Cookie.new($session['session']['name'], $session['session']['value'])
+			request['Cookie'] = cookie.to_s
+		else
+			request.basic_auth $opts[:username], $opts[:password]
+		end
 		response = http.request request
 		# If the response was good, then grab the data
 		if response.code =~ /20[0-9]{1}/
@@ -203,7 +227,12 @@ def mark_resolved_jira_tickets_as_complete_in_omnifocus (omnifocus_document)
 
 			Net::HTTP.start(uri.hostname, uri.port, :use_ssl => uri.scheme == 'https') do |http|
 				request = Net::HTTP::Get.new(uri)
-				request.basic_auth $opts[:username], $opts[:password]
+				if $session['session']
+					cookie = CGI::Cookie.new($session['session']['name'], $session['session']['value'])
+					request['Cookie'] = cookie.to_s
+				else
+					request.basic_auth $opts[:username], $opts[:password]
+				end
 				response = http.request request
 
 				if response.code =~ /20[0-9]{1}/
@@ -212,9 +241,10 @@ def mark_resolved_jira_tickets_as_complete_in_omnifocus (omnifocus_document)
 					resolution = data["fields"]["resolution"]
 					if resolution != nil
 						# if resolved, mark it as complete in OmniFocus
-						if task.completed.get != true
+						unless task.completed.get
 							task.completed.set(true)
 							puts "Marked task completed " + jira_id
+							next
 						end
 					end
 					# Check to see if the Jira ticket has been unassigned or assigned to someone else, if so delete it.
@@ -252,6 +282,7 @@ end
 def main ()
 	if app_is_running("OmniFocus")
 		$opts = get_opts
+		$session = ''
 		check_options()
 		omnifocus_document = get_omnifocus_document
 		add_jira_tickets_to_omnifocus(omnifocus_document)
